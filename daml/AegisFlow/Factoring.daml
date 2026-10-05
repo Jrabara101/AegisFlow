@@ -1,0 +1,170 @@
+module AegisFlow.Factoring where
+
+-- | Milestone status reported by the agentic tracking layer (logistics/ERP webhook).
+data MilestoneStatus
+  = Pending
+  | Shipped
+  | Delivered
+  | Confirmed
+  deriving (Eq, Show)
+
+-- | Seller-only commercial details of an invoice. Kept in its own contract so
+-- it never takes part in a transaction the lender witnesses: buyer identity
+-- and line items stay on the seller's node only.
+template InvoiceDetails
+  with
+    seller    : Party
+    invoiceId : Text
+    buyerRef  : Text        -- ^ Opaque reference, not the buyer's real identity.
+    lineItems : [Text]
+  where
+    signatory seller
+
+    key (seller, invoiceId) : (Party, Text)
+    maintainer key._1
+
+-- | The tokenized invoice. Carries only the fields the lender needs to
+-- underwrite (face value, due date, milestone), because the lender becomes
+-- a witness of it when the advance is disbursed.
+template InvoiceAsset
+  with
+    seller        : Party
+    invoiceId     : Text
+    faceValue     : Decimal
+    dueDate       : Time
+    milestone     : MilestoneStatus
+    financed      : Bool
+  where
+    signatory seller
+    ensure faceValue > 0.0
+
+    key (seller, invoiceId) : (Party, Text)
+    maintainer key._1
+
+    -- | Seller proposes financing to a specific lender. Only that lender
+    -- becomes an observer of the resulting proposal — no other party on
+    -- the network sees this invoice exists. Nonconsuming: the invoice
+    -- stays live so the proposal's invoiceCid remains valid.
+    nonconsuming choice InvoiceAsset_ProposeFinancing : ContractId FundingProposal
+      with
+        lender        : Party
+        advanceRate   : Decimal   -- ^ e.g. 0.90 for a 90% advance against face value
+      controller seller
+      do
+        assertMsg "advance rate must be between 0 and 1" (advanceRate > 0.0 && advanceRate <= 1.0)
+        assertMsg "invoice already financed" (not financed)
+        create FundingProposal with
+          seller
+          lender
+          invoiceCid = self
+          invoiceId
+          faceValue
+          advanceRate
+          dueDate
+
+    -- | Agentic trigger: updates milestone status from a logistics/ERP
+    -- webhook. Only the seller's backend (acting as the seller party)
+    -- can advance this — the lender never needs visibility into raw
+    -- shipment data, only the milestone enum. Consuming: returns the
+    -- new contract's id since the old one is replaced.
+    choice InvoiceAsset_UpdateMilestone : ContractId InvoiceAsset
+      with
+        newMilestone : MilestoneStatus
+      controller seller
+      do
+        create this with milestone = newMilestone
+
+-- | A financing offer scoped to exactly one lender. This is the only
+-- contract type the lender ever sees for a given invoice — it carries
+-- just enough data (face value, advance rate, due date) to underwrite
+-- and settle, never the buyer identity or line items.
+template FundingProposal
+  with
+    seller      : Party
+    lender      : Party
+    invoiceCid  : ContractId InvoiceAsset
+    invoiceId   : Text
+    faceValue   : Decimal
+    advanceRate : Decimal
+    dueDate     : Time
+  where
+    signatory seller
+    observer lender
+
+    choice FundingProposal_Accept : ContractId FundingAgreement
+      controller lender
+      do
+        create FundingAgreement with
+          seller
+          lender
+          invoiceCid
+          invoiceId
+          faceValue
+          advanceAmount = faceValue * advanceRate
+          dueDate
+          settled = False
+
+    choice FundingProposal_Reject : ()
+      controller lender
+      do
+        pure ()
+
+    choice FundingProposal_Withdraw : ()
+      controller seller
+      do
+        pure ()
+
+-- | The atomic settlement contract. Both seller and lender are signatories
+-- so neither party can unilaterally alter the terms once accepted — the
+-- advance payout and the invoice-collateral lock happen in one ledger
+-- transaction, eliminating T+2 counterparty risk.
+template FundingAgreement
+  with
+    seller        : Party
+    lender        : Party
+    invoiceCid    : ContractId InvoiceAsset
+    invoiceId     : Text
+    faceValue     : Decimal
+    advanceAmount : Decimal
+    dueDate       : Time
+    settled       : Bool
+  where
+    signatory seller, lender
+
+    -- | Atomic drawdown: marks the source invoice as financed and confirms
+    -- the advance was disbursed, in a single ledger transaction. Controlled
+    -- by the seller because only the seller can see the invoice; the
+    -- lender's authority still applies since it co-signed this agreement.
+    -- In a full deployment the payout leg is a Holding transfer against a
+    -- stablecoin executed in this same choice body, giving true atomic swap
+    -- semantics — no leg ever settles alone. Returns the re-created
+    -- agreement (pointing at the new invoice) and the new invoice.
+    choice FundingAgreement_Disburse : (ContractId FundingAgreement, ContractId InvoiceAsset)
+      controller seller
+      do
+        invoice <- fetch invoiceCid
+        assertMsg "invoice mismatch" (invoice.invoiceId == invoiceId)
+        archive invoiceCid
+        newInvoiceCid <- create invoice with financed = True
+        newAgreementCid <- create this with invoiceCid = newInvoiceCid
+        pure (newAgreementCid, newInvoiceCid)
+
+    -- | Agentic milestone-triggered tranche release. Called by the seller's
+    -- backend agent once a logistics/ERP webhook reports the milestone
+    -- required by the funding terms (e.g. Delivered) — no manual bank
+    -- audit step, no exposure of the underlying shipment data to the lender.
+    nonconsuming choice FundingAgreement_ReleaseOnMilestone : ()
+      with
+        observedMilestone : MilestoneStatus
+      controller seller
+      do
+        assertMsg "milestone not yet at required stage" (observedMilestone == Delivered || observedMilestone == Confirmed)
+        pure ()
+
+    -- | Final repayment settlement at due date: buyer's payment (routed
+    -- through seller, since buyer is off-ledger / not a Canton party)
+    -- closes the loop and releases the lender's claim on the invoice.
+    choice FundingAgreement_Settle : ()
+      controller seller, lender
+      do
+        pure ()
