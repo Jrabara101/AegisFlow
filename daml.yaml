@@ -1,0 +1,9 @@
+sdk-version: 2.9.5
+name: aegisflow
+source: daml
+version: 0.1.0
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script
+build-options: []

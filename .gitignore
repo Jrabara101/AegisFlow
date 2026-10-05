@@ -1,0 +1,34 @@
+# Daml build output
+.daml/
+*.dar
+
+# Node / frontend
+node_modules/
+dist/
+build/
+.next/
+*.log
+npm-debug.log*
+
+# Python / agent backend
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/

@@ -1,0 +1,100 @@
+module AegisFlow.InvoiceAsset where
+
+-- | Milestone status reported by the agentic tracking layer (logistics/ERP webhook).
+data MilestoneStatus
+  = Pending
+  | Shipped
+  | Delivered
+  | Confirmed
+  deriving (Eq, Show)
+
+-- | The tokenized invoice. Seller is the sole signatory so buyer identity,
+-- line items and margin never appear on any ledger the lender does not
+-- explicitly get added to as an observer.
+template InvoiceAsset
+  with
+    seller        : Party
+    buyerRef      : Text        -- ^ Opaque reference, not the buyer's real identity.
+    invoiceId     : Text
+    faceValue     : Decimal
+    dueDate       : Time
+    milestone     : MilestoneStatus
+    financed      : Bool
+  where
+    signatory seller
+    ensures faceValue > 0.0
+
+    key (seller, invoiceId) : (Party, Text)
+    maintainer key._1
+
+    -- | Seller proposes financing to a specific lender. Only that lender
+    -- becomes an observer of the resulting proposal — no other party on
+    -- the network sees this invoice exists.
+    choice InvoiceAsset_ProposeFinancing : ContractId FundingProposal
+      with
+        lender        : Party
+        advanceRate   : Decimal   -- ^ e.g. 0.90 for a 90% advance against face value
+      controller seller
+      do
+        assertMsg "advance rate must be between 0 and 1" (advanceRate > 0.0 && advanceRate <= 1.0)
+        assertMsg "invoice already financed" (not financed)
+        create FundingProposal with
+          seller
+          lender
+          invoiceCid = self
+          invoiceId
+          faceValue
+          advanceRate
+          dueDate
+
+    -- | Agentic trigger: updates milestone status from a logistics/ERP
+    -- webhook. Only the seller's backend (acting as the seller party)
+    -- can advance this — the lender never needs visibility into raw
+    -- shipment data, only the milestone enum. Consuming: returns the
+    -- new contract's id since the old one is replaced.
+    choice InvoiceAsset_UpdateMilestone : ContractId InvoiceAsset
+      with
+        newMilestone : MilestoneStatus
+      controller seller
+      do
+        create this with milestone = newMilestone
+
+-- | A financing offer scoped to exactly one lender. This is the only
+-- contract type the lender ever sees for a given invoice — it carries
+-- just enough data (face value, advance rate, due date) to underwrite
+-- and settle, never the buyer identity or line items.
+template FundingProposal
+  with
+    seller      : Party
+    lender      : Party
+    invoiceCid  : ContractId InvoiceAsset
+    invoiceId   : Text
+    faceValue   : Decimal
+    advanceRate : Decimal
+    dueDate     : Time
+  where
+    signatory seller
+    observer lender
+
+    choice FundingProposal_Accept : ContractId FundingAgreement
+      controller lender
+      do
+        create FundingAgreement with
+          seller
+          lender
+          invoiceCid
+          invoiceId
+          faceValue
+          advanceAmount = faceValue * advanceRate
+          dueDate
+          settled = False
+
+    choice FundingProposal_Reject : ()
+      controller lender
+      do
+        pure ()
+
+    choice FundingProposal_Withdraw : ()
+      controller seller
+      do
+        pure ()

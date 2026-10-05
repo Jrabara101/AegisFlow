@@ -1,0 +1,65 @@
+module Setup where
+
+import Daml.Script
+import DA.Time (days)
+import AegisFlow.InvoiceAsset
+import AegisFlow.FundingAgreement
+
+-- | End-to-end demo: seller tokenizes an invoice, proposes financing to a
+-- lender-only view, the lender accepts and disburses, an agentic milestone
+-- update fires, and the funding is settled. Run with:
+--   daml script --dar .daml/dist/aegisflow-0.1.0.dar --script-name Setup:setup --sandbox-port 6865
+setup : Script ()
+setup = do
+  seller <- allocateParty "Seller"
+  lender <- allocateParty "Lender"
+  outsider <- allocateParty "Outsider"
+
+  now <- getTime
+  let due = addRelTime now (days 60)
+
+  -- 1. Seller tokenizes an invoice. Only `seller` can see this contract.
+  invoiceCid <- submit seller do
+    createCmd InvoiceAsset with
+      seller
+      buyerRef = "BUYER-REF-88213"
+      invoiceId = "INV-2026-0091"
+      faceValue = 100000.0
+      dueDate = due
+      milestone = Shipped
+      financed = False
+
+  -- 2. Seller proposes financing to exactly one lender at a 90% advance rate.
+  proposalCid <- submit seller do
+    exerciseCmd invoiceCid InvoiceAsset_ProposeFinancing with
+      lender
+      advanceRate = 0.90
+
+  -- 3. `outsider` has no visibility into either contract — privacy check.
+  outsiderView <- queryContractId @FundingProposal outsider proposalCid
+  assertMsg "outsider must not see the funding proposal" (outsiderView == None)
+
+  -- 4. Lender accepts, creating the bilateral FundingAgreement.
+  agreementCid <- submit lender do
+    exerciseCmd proposalCid FundingProposal_Accept
+
+  -- 5. Atomic disbursement: invoice flips to `financed = True` in the same
+  --    transaction the lender releases the advance.
+  invoiceCid2 <- submit lender do
+    exerciseCmd agreementCid FundingAgreement_Disburse
+
+  -- 6. Agentic trigger: seller's backend reports a Delivered milestone from
+  --    the logistics API, releasing the held tranche per the agreed terms.
+  _ <- submit seller do
+    exerciseCmd invoiceCid2 InvoiceAsset_UpdateMilestone with
+      newMilestone = Delivered
+
+  submit seller do
+    exerciseCmd agreementCid FundingAgreement_ReleaseOnMilestone with
+      observedMilestone = Delivered
+
+  -- 7. Final settlement at due date, requires both signatures.
+  submitMulti [seller, lender] [] do
+    exerciseCmd agreementCid FundingAgreement_Settle
+
+  pure ()

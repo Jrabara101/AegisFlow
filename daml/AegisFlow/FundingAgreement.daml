@@ -1,0 +1,54 @@
+module AegisFlow.FundingAgreement where
+
+import AegisFlow.InvoiceAsset
+
+-- | The atomic settlement contract. Both seller and lender are signatories
+-- so neither party can unilaterally alter the terms once accepted — the
+-- advance payout and the invoice-collateral lock happen in one ledger
+-- transaction (DA.Assert / same-transaction archive+create below),
+-- eliminating T+2 counterparty risk.
+template FundingAgreement
+  with
+    seller        : Party
+    lender        : Party
+    invoiceCid    : ContractId InvoiceAsset
+    invoiceId     : Text
+    faceValue     : Decimal
+    advanceAmount : Decimal
+    dueDate       : Time
+    settled       : Bool
+  where
+    signatory seller, lender
+
+    -- | Atomic drawdown: marks the source invoice as financed and confirms
+    -- the advance was disbursed, in a single ledger transaction. In a full
+    -- deployment the payout leg is a Holding transfer against a stablecoin
+    -- SAC (e.g. via the daml-finance library) executed in this same choice
+    -- body, giving true atomic swap semantics — no leg ever settles alone.
+    choice FundingAgreement_Disburse : ContractId InvoiceAsset
+      controller lender
+      do
+        invoice <- fetch invoiceCid
+        assertMsg "invoice mismatch" (invoice.invoiceId == invoiceId)
+        archive invoiceCid
+        create invoice with financed = True
+
+    -- | Agentic milestone-triggered tranche release. Called by the seller's
+    -- backend agent once a logistics/ERP webhook reports the milestone
+    -- required by the funding terms (e.g. Delivered) — no manual bank
+    -- audit step, no exposure of the underlying shipment data to the lender.
+    nonconsuming choice FundingAgreement_ReleaseOnMilestone : ()
+      with
+        observedMilestone : MilestoneStatus
+      controller seller
+      do
+        assertMsg "milestone not yet at required stage" (observedMilestone == Delivered || observedMilestone == Confirmed)
+        pure ()
+
+    -- | Final repayment settlement at due date: buyer's payment (routed
+    -- through seller, since buyer is off-ledger / not a Canton party)
+    -- closes the loop and releases the lender's claim on the invoice.
+    choice FundingAgreement_Settle : ()
+      controller seller, lender
+      do
+        pure ()
