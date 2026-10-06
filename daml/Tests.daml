@@ -1,0 +1,213 @@
+module Tests where
+
+import Daml.Script
+import DA.Time (days, addRelTime)
+import AegisFlow.Types
+import AegisFlow.Cash
+import AegisFlow.Oracle
+import AegisFlow.Factoring
+import Setup (balanceOf)
+
+-- Negative-path tests: each one proves an attack or mistake is rejected
+-- by the ledger, not just by the UI. Run with `daml test`.
+
+data Fixture = Fixture
+  with
+    seller     : Party
+    lender     : Party
+    oracle     : Party
+    issuer     : Party
+    outsider   : Party
+    invoiceCid : ContractId InvoiceAsset
+
+invoiceRef : Text
+invoiceRef = "INV-TEST-1"
+
+defaultTranches : [Tranche]
+defaultTranches = [Tranche Shipped 0.6, Tranche Delivered 0.3]
+
+-- | Parties plus a 100,000 unfinanced invoice owned by the seller.
+newFixture : Script Fixture
+newFixture = do
+  seller <- allocateParty "Seller"
+  lender <- allocateParty "Lender"
+  oracle <- allocateParty "LogisticsOracle"
+  issuer <- allocateParty "CashIssuer"
+  outsider <- allocateParty "Outsider"
+  now <- getTime
+  invoiceCid <- submit seller do
+    createCmd InvoiceAsset with
+      seller
+      invoiceId = invoiceRef
+      faceValue = 100000.0
+      dueDate = addRelTime now (days 60)
+      milestone = Pending
+      financed = False
+  pure Fixture with ..
+
+issue : Party -> Party -> Decimal -> Script (ContractId CashHolding)
+issue issuer owner amount = submit issuer do
+  createCmd CashHolding with issuer; owner; currency = "USD"; amount; observers = []
+
+propose : Fixture -> Party -> [Tranche] -> Script (ContractId FundingProposal)
+propose fx lender tranches = submit fx.seller do
+  exerciseCmd fx.invoiceCid InvoiceAsset_ProposeFinancing with
+    lender
+    oracle = fx.oracle
+    tranches
+    discountRate = 0.12
+    cashIssuer = fx.issuer
+    currency = "USD"
+
+-- | Proposes the default terms to `lender`, escrows 90,000 and accepts.
+fund : Fixture -> Party -> Script (ContractId FundingAgreement)
+fund fx lender = do
+  proposalCid <- propose fx lender defaultTranches
+  escrowCid <- issue fx.issuer lender 90000.0
+  submit lender do
+    exerciseCmd proposalCid FundingProposal_Accept with escrowCid
+
+attestBy : Party -> Fixture -> MilestoneStatus -> Script (ContractId MilestoneAttestation)
+attestBy signer fx milestone = do
+  now <- getTime
+  submit signer do
+    createCmd MilestoneAttestation with
+      oracle = signer
+      seller = fx.seller
+      invoiceId = invoiceRef
+      milestone
+      evidenceHash = "sha256:test"
+      attestedAt = now
+
+attest : Fixture -> MilestoneStatus -> Script (ContractId MilestoneAttestation)
+attest fx = attestBy fx.oracle fx
+
+-- | The lender can reject and the seller can withdraw a proposal.
+testRejectAndWithdraw : Script ()
+testRejectAndWithdraw = do
+  fx <- newFixture
+  p1 <- propose fx fx.lender defaultTranches
+  submit fx.lender do exerciseCmd p1 FundingProposal_Reject
+  p2 <- propose fx fx.lender defaultTranches
+  submit fx.seller do exerciseCmd p2 FundingProposal_Withdraw
+  remaining <- query @FundingProposal fx.lender
+  assertMsg "no proposals should remain" (null remaining)
+
+-- | Bad terms are refused at proposal time.
+testInvalidTermsRejected : Script ()
+testInvalidTermsRejected = do
+  fx <- newFixture
+  -- Advancing more than 100% of face value.
+  submitMustFail fx.seller do
+    exerciseCmd fx.invoiceCid InvoiceAsset_ProposeFinancing with
+      lender = fx.lender; oracle = fx.oracle; discountRate = 0.12
+      cashIssuer = fx.issuer; currency = "USD"
+      tranches = [Tranche Shipped 0.7, Tranche Delivered 0.4]
+  -- Milestones out of order.
+  submitMustFail fx.seller do
+    exerciseCmd fx.invoiceCid InvoiceAsset_ProposeFinancing with
+      lender = fx.lender; oracle = fx.oracle; discountRate = 0.12
+      cashIssuer = fx.issuer; currency = "USD"
+      tranches = [Tranche Delivered 0.6, Tranche Shipped 0.3]
+  -- Empty schedule.
+  submitMustFail fx.seller do
+    exerciseCmd fx.invoiceCid InvoiceAsset_ProposeFinancing with
+      lender = fx.lender; oracle = fx.oracle; discountRate = 0.12
+      cashIssuer = fx.issuer; currency = "USD"
+      tranches = []
+
+-- | Escrow must be exactly the advance, in the agreed currency.
+testWrongEscrowRejected : Script ()
+testWrongEscrowRejected = do
+  fx <- newFixture
+  proposalCid <- propose fx fx.lender defaultTranches
+  tooSmall <- issue fx.issuer fx.lender 50000.0
+  submitMustFail fx.lender do
+    exerciseCmd proposalCid FundingProposal_Accept with escrowCid = tooSmall
+  wrongCurrency <- submit fx.issuer do
+    createCmd CashHolding with
+      issuer = fx.issuer; owner = fx.lender; currency = "EUR"; amount = 90000.0; observers = []
+  submitMustFail fx.lender do
+    exerciseCmd proposalCid FundingProposal_Accept with escrowCid = wrongCurrency
+
+-- | The same invoice cannot be financed twice: once lender A's agreement
+-- releases a tranche, lender B's agreement points at a spent invoice. B can
+-- then cancel and recover its escrow.
+testDoubleFinancingBlocked : Script ()
+testDoubleFinancingBlocked = do
+  fx <- newFixture
+  lenderB <- allocateParty "LenderB"
+  agreementA <- fund fx fx.lender
+  agreementB <- fund fx lenderB
+  shipped <- attest fx Shipped
+  _ <- submit fx.seller do
+    exerciseCmd agreementA FundingAgreement_ReleaseTranche with attestationCid = shipped
+  submitMustFail fx.seller do
+    exerciseCmd agreementB FundingAgreement_ReleaseTranche with attestationCid = shipped
+  Some refundCid <- submit lenderB do
+    exerciseCmd agreementB FundingAgreement_Cancel
+  Some refund <- queryContractId lenderB refundCid
+  assertMsg "lender B escrow should be unlocked" (null refund.observers)
+  balanceB <- balanceOf lenderB
+  assertMsg "lender B should get its full escrow back" (balanceB == 90000.0)
+
+-- | A tranche cannot be released before its milestone is attested.
+testReleaseBeforeMilestoneBlocked : Script ()
+testReleaseBeforeMilestoneBlocked = do
+  fx <- newFixture
+  agreementCid <- fund fx fx.lender
+  shipped <- attest fx Shipped
+  (agreementCid, _) <- submit fx.seller do
+    exerciseCmd agreementCid FundingAgreement_ReleaseTranche with attestationCid = shipped
+  -- The second tranche needs Delivered; reusing the Shipped attestation fails.
+  submitMustFail fx.seller do
+    exerciseCmd agreementCid FundingAgreement_ReleaseTranche with attestationCid = shipped
+
+-- | The seller cannot forge an oracle signature, and an attestation signed
+-- by anyone other than the agreed oracle is refused.
+testForgedAttestationBlocked : Script ()
+testForgedAttestationBlocked = do
+  fx <- newFixture
+  agreementCid <- fund fx fx.lender
+  now <- getTime
+  submitMustFail fx.seller do
+    createCmd MilestoneAttestation with
+      oracle = fx.oracle; seller = fx.seller; invoiceId = invoiceRef
+      milestone = Delivered; evidenceHash = "forged"; attestedAt = now
+  selfSigned <- attestBy fx.seller fx Delivered
+  submitMustFail fx.seller do
+    exerciseCmd agreementCid FundingAgreement_ReleaseTranche with attestationCid = selfSigned
+
+-- | Settlement requires exactly principal plus accrued fee.
+testWrongRepaymentRejected : Script ()
+testWrongRepaymentRejected = do
+  fx <- newFixture
+  agreementCid <- fund fx fx.lender
+  shipped <- attest fx Shipped
+  (agreementCid, _) <- submit fx.seller do
+    exerciseCmd agreementCid FundingAgreement_ReleaseTranche with attestationCid = shipped
+  -- Principal only, no fee: 60,000 instead of 61,200.
+  shortPayment <- issue fx.issuer fx.seller 60000.0
+  submitMustFail fx.seller do
+    exerciseCmd agreementCid FundingAgreement_Settle with repaymentCid = shortPayment
+
+-- | Settling before every tranche is drawn returns the unused escrow to
+-- the lender, and the lender cannot cancel once money has moved.
+testEarlySettleReturnsEscrow : Script ()
+testEarlySettleReturnsEscrow = do
+  fx <- newFixture
+  agreementCid <- fund fx fx.lender
+  shipped <- attest fx Shipped
+  (agreementCid, _) <- submit fx.seller do
+    exerciseCmd agreementCid FundingAgreement_ReleaseTranche with attestationCid = shipped
+  submitMustFail fx.lender do
+    exerciseCmd agreementCid FundingAgreement_Cancel
+  -- 60,000 principal + 60,000 x 12% x 60/360 = 1,200 fee.
+  repayment <- issue fx.issuer fx.seller 61200.0
+  _ <- submit fx.seller do
+    exerciseCmd agreementCid FundingAgreement_Settle with repaymentCid = repayment
+  lenderBalance <- balanceOf fx.lender
+  assertMsg "lender gets repayment plus unused 30,000 escrow" (lenderBalance == 91200.0)
+  lenderCash <- query @CashHolding fx.lender
+  assertMsg "returned escrow must no longer be disclosed to the seller"
+    (all (\(_, h) -> h.owner /= fx.lender || null h.observers) lenderCash)
