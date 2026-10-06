@@ -1,0 +1,70 @@
+module Init where
+
+import Daml.Script
+import DA.Time (days, addRelTime)
+import AegisFlow.Types
+import AegisFlow.Cash
+import AegisFlow.Factoring
+
+-- | Party ids handed to the backend. Written as JSON by
+-- `daml script --output-file`, which the backend reads at startup.
+data Parties = Parties
+  with
+    seller   : Party
+    lender   : Party
+    oracle   : Party
+    issuer   : Party
+    outsider : Party
+  deriving (Eq, Show)
+
+-- | Seeds a running ledger with one funded deal, ready for the backend
+-- agent: a 100,000 invoice, 90,000 escrowed by the lender, tranches of 60%
+-- on Shipped and 30% on Delivered at 12%, nothing released yet.
+init : Script Parties
+init = do
+  seller <- allocatePartyWithHint "Seller" (PartyIdHint "Seller")
+  lender <- allocatePartyWithHint "Lender" (PartyIdHint "Lender")
+  oracle <- allocatePartyWithHint "LogisticsOracle" (PartyIdHint "LogisticsOracle")
+  issuer <- allocatePartyWithHint "CashIssuer" (PartyIdHint "CashIssuer")
+  outsider <- allocatePartyWithHint "Outsider" (PartyIdHint "Outsider")
+
+  now <- getTime
+  let invoiceId = "INV-2026-0091"
+
+  _ <- submit seller do
+    createCmd InvoiceDetails with
+      seller
+      invoiceId
+      buyerRef = "BUYER-REF-88213"
+      lineItems = ["200x industrial valves", "Freight and insurance"]
+  invoiceCid <- submit seller do
+    createCmd InvoiceAsset with
+      seller
+      invoiceId
+      faceValue = 100000.0
+      dueDate = addRelTime now (days 60)
+      milestone = Pending
+      financed = False
+
+  lenderCashCid <- submit issuer do
+    createCmd CashHolding with
+      issuer
+      owner = lender
+      currency = "USD"
+      amount = 1000000.0
+      observers = []
+  (escrowCid, _) <- submit lender do
+    exerciseCmd lenderCashCid Holding_Split with splitAmount = 90000.0
+
+  proposalCid <- submit seller do
+    exerciseCmd invoiceCid InvoiceAsset_ProposeFinancing with
+      lender
+      oracle
+      tranches = [Tranche Shipped 0.6, Tranche Delivered 0.3]
+      discountRate = 0.12
+      cashIssuer = issuer
+      currency = "USD"
+  _ <- submit lender do
+    exerciseCmd proposalCid FundingProposal_Accept with escrowCid
+
+  pure Parties with ..

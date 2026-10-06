@@ -2,6 +2,9 @@
 .daml/
 *.dar
 
+# Backend runtime data (party ids, package id, activity log)
+backend/data/
+
 # Node / frontend
 node_modules/
 dist/

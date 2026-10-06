@@ -13,6 +13,8 @@ daml/
     Factoring.daml                 # InvoiceDetails, InvoiceAsset, FundingProposal, FundingAgreement
   Setup.daml                       # end-to-end demo with balance and privacy assertions
   Tests.daml                       # negative-path tests (attacks and mistakes the ledger rejects)
+  Init.daml                        # seeds a running ledger with parties + one funded deal for the backend
+backend/                           # Node.js agent layer: mock carrier, logistics oracle, seller agent (see backend/README.md)
 Bookmark.md                        # hackathon links, devtools catalog, starter repos
 ```
 
@@ -55,7 +57,7 @@ daml install 2.10.6
 ```
 daml test
 ```
-runs the demo and all tests against an ephemeral ledger. Against a running sandbox:
+runs the demo and all tests against an ephemeral ledger. To run the full system with the backend agent, see [backend/README.md](backend/README.md). Against a running sandbox:
 ```
 daml build
 daml script --dar .daml/dist/aegisflow-0.1.0.dar --script-name Setup:setup --ledger-host localhost --ledger-port 6865
@@ -63,6 +65,6 @@ daml script --dar .daml/dist/aegisflow-0.1.0.dar --script-name Setup:setup --led
 
 ## Known gaps / next steps
 - `CashHolding` is a stand-in; production would use a Canton Token Standard holding (e.g. USDC via xReserve).
-- The backend agent (webhook → attestation → tranche release) is not built yet — the demo script plays the oracle and agent.
+- The backend agent runs on the local sandbox only, with ledger auth off (see backend/README.md for its demo shortcuts).
 - SDK 2.x only: the current Canton Network runs Daml 3.x, which (to be confirmed) drops the contract keys used here. Revisit before final deployment.
 - The lender can cancel unilaterally before the first release; a real deployment may want a notice period.
