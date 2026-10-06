@@ -1,12 +1,34 @@
 module AegisFlow.Factoring where
 
--- | Milestone status reported by the agentic tracking layer (logistics/ERP webhook).
-data MilestoneStatus
-  = Pending
-  | Shipped
-  | Delivered
-  | Confirmed
-  deriving (Eq, Show)
+import DA.List ((!!))
+import DA.Time (subTime, convertRelTimeToMicroseconds)
+import AegisFlow.Types
+import AegisFlow.Cash
+import AegisFlow.Oracle
+
+-- | Share of face value advanced across all tranches.
+advanceFraction : [Tranche] -> Decimal
+advanceFraction = sum . map (\t -> t.fraction)
+
+-- | A schedule is valid when it is non-empty, every slice is positive, the
+-- total advance is at most 100% of face value, and milestones strictly
+-- increase so tranches release in order.
+validTranches : [Tranche] -> Bool
+validTranches ts =
+  not (null ts)
+    && all (\t -> t.fraction > 0.0) ts
+    && advanceFraction ts <= 1.0
+    && and (zipWith (<) milestones (drop 1 milestones))
+  where
+    milestones = map (\t -> t.milestone) ts
+
+-- | Discount fee on `amount` advanced at `from` and repaid at `to`:
+-- amount x annual rate x days / 360, rounded to cents. Zero if `from` is
+-- already past `to`.
+discountFee : Decimal -> Decimal -> Time -> Time -> Decimal
+discountFee rate amount from to =
+  let days = intToDecimal (convertRelTimeToMicroseconds (subTime to from)) / 86400000000.0
+  in roundCommercial 2 (amount * rate * max 0.0 days / 360.0)
 
 -- | Seller-only commercial details of an invoice. Kept in its own contract so
 -- it never takes part in a transaction the lender witnesses: buyer identity
@@ -25,7 +47,8 @@ template InvoiceDetails
 
 -- | The tokenized invoice. Carries only the fields the lender needs to
 -- underwrite (face value, due date, milestone), because the lender becomes
--- a witness of it when the advance is disbursed.
+-- a witness of it when a tranche is released. `milestone` is only advanced
+-- by oracle attestations during tranche release, never by seller input.
 template InvoiceAsset
   with
     seller        : Party
@@ -47,62 +70,82 @@ template InvoiceAsset
     -- stays live so the proposal's invoiceCid remains valid.
     nonconsuming choice InvoiceAsset_ProposeFinancing : ContractId FundingProposal
       with
-        lender        : Party
-        advanceRate   : Decimal   -- ^ e.g. 0.90 for a 90% advance against face value
+        lender       : Party
+        oracle       : Party     -- ^ Logistics oracle both sides trust for milestones.
+        tranches     : [Tranche]
+        discountRate : Decimal   -- ^ Annual rate, e.g. 0.12 for 12%.
+        cashIssuer   : Party
+        currency     : Text
       controller seller
       do
-        assertMsg "advance rate must be between 0 and 1" (advanceRate > 0.0 && advanceRate <= 1.0)
+        assertMsg "invalid tranche schedule" (validTranches tranches)
+        assertMsg "discount rate must not be negative" (discountRate >= 0.0)
         assertMsg "invoice already financed" (not financed)
         create FundingProposal with
           seller
           lender
+          oracle
           invoiceCid = self
           invoiceId
           faceValue
-          advanceRate
+          tranches
+          discountRate
+          cashIssuer
+          currency
           dueDate
 
-    -- | Agentic trigger: updates milestone status from a logistics/ERP
-    -- webhook. Only the seller's backend (acting as the seller party)
-    -- can advance this — the lender never needs visibility into raw
-    -- shipment data, only the milestone enum. Consuming: returns the
-    -- new contract's id since the old one is replaced.
-    choice InvoiceAsset_UpdateMilestone : ContractId InvoiceAsset
-      with
-        newMilestone : MilestoneStatus
-      controller seller
-      do
-        create this with milestone = newMilestone
-
 -- | A financing offer scoped to exactly one lender. This is the only
--- contract type the lender ever sees for a given invoice — it carries
--- just enough data (face value, advance rate, due date) to underwrite
--- and settle, never the buyer identity or line items.
+-- contract type the lender ever sees for a given invoice before funding —
+-- it carries just enough data to underwrite and settle, never the buyer
+-- identity or line items.
 template FundingProposal
   with
-    seller      : Party
-    lender      : Party
-    invoiceCid  : ContractId InvoiceAsset
-    invoiceId   : Text
-    faceValue   : Decimal
-    advanceRate : Decimal
-    dueDate     : Time
+    seller       : Party
+    lender       : Party
+    oracle       : Party
+    invoiceCid   : ContractId InvoiceAsset
+    invoiceId    : Text
+    faceValue    : Decimal
+    tranches     : [Tranche]
+    discountRate : Decimal
+    cashIssuer   : Party
+    currency     : Text
+    dueDate      : Time
   where
     signatory seller
     observer lender
 
+    -- | Lender accepts by escrowing exactly the advance amount. The holding
+    -- must be pre-split in a separate transaction so the seller, who
+    -- witnesses this one, never learns the lender's wider balance.
     choice FundingProposal_Accept : ContractId FundingAgreement
+      with
+        escrowCid : ContractId CashHolding
       controller lender
       do
+        cash <- fetch escrowCid
+        let advanceAmount = faceValue * advanceFraction tranches
+        assertMsg "escrow must be lender-owned cash of the agreed issuer and currency"
+          (cash.owner == lender && cash.issuer == cashIssuer && cash.currency == currency)
+        assertMsg "escrow must equal the advance amount exactly" (cash.amount == advanceAmount)
+        lockedCid <- exercise escrowCid Holding_SetObservers with newObservers = [seller]
         create FundingAgreement with
           seller
           lender
+          oracle
           invoiceCid
           invoiceId
           faceValue
-          advanceAmount = faceValue * advanceRate
+          tranches
+          discountRate
+          cashIssuer
+          currency
           dueDate
-          settled = False
+          advanceAmount
+          escrowCid = Some lockedCid
+          releasedCount = 0
+          releasedTotal = 0.0
+          feeAccrued = 0.0
 
     choice FundingProposal_Reject : ()
       controller lender
@@ -115,56 +158,109 @@ template FundingProposal
         pure ()
 
 -- | The atomic settlement contract. Both seller and lender are signatories
--- so neither party can unilaterally alter the terms once accepted — the
--- advance payout and the invoice-collateral lock happen in one ledger
--- transaction, eliminating T+2 counterparty risk.
+-- so neither party can unilaterally alter the terms once accepted. The
+-- lender's advance sits in escrow (disclosed to the seller) and moves to
+-- the seller tranche by tranche, each in the same transaction that locks
+-- the invoice — no leg ever settles alone.
 template FundingAgreement
   with
     seller        : Party
     lender        : Party
+    oracle        : Party
     invoiceCid    : ContractId InvoiceAsset
     invoiceId     : Text
     faceValue     : Decimal
-    advanceAmount : Decimal
+    tranches      : [Tranche]
+    discountRate  : Decimal
+    cashIssuer    : Party
+    currency      : Text
     dueDate       : Time
-    settled       : Bool
+    advanceAmount : Decimal
+    escrowCid     : Optional (ContractId CashHolding)  -- ^ Unreleased advance; None once fully drawn.
+    releasedCount : Int                                -- ^ Tranches released so far.
+    releasedTotal : Decimal                            -- ^ Principal paid out to the seller.
+    feeAccrued    : Decimal                            -- ^ Discount fee owed at settlement.
   where
     signatory seller, lender
 
-    -- | Atomic drawdown: marks the source invoice as financed and confirms
-    -- the advance was disbursed, in a single ledger transaction. Controlled
-    -- by the seller because only the seller can see the invoice; the
-    -- lender's authority still applies since it co-signed this agreement.
-    -- In a full deployment the payout leg is a Holding transfer against a
-    -- stablecoin executed in this same choice body, giving true atomic swap
-    -- semantics — no leg ever settles alone. Returns the re-created
-    -- agreement (pointing at the new invoice) and the new invoice.
-    choice FundingAgreement_Disburse : (ContractId FundingAgreement, ContractId InvoiceAsset)
+    -- | Agentic tranche release. The seller's backend agent calls this with
+    -- an oracle attestation once the logistics milestone for the next
+    -- tranche is reached. In one transaction it locks the invoice as
+    -- financed, pays the tranche from escrow to the seller, and accrues the
+    -- discount fee from now until the due date. Controlled by the seller
+    -- because only the seller can see the invoice; the lender's authority
+    -- still applies since it co-signed this agreement. Returns the
+    -- re-created agreement and the seller's new cash holding.
+    choice FundingAgreement_ReleaseTranche : (ContractId FundingAgreement, ContractId CashHolding)
+      with
+        attestationCid : ContractId MilestoneAttestation
       controller seller
       do
+        assertMsg "all tranches already released" (releasedCount < length tranches)
+        let tranche = tranches !! releasedCount
+        attestation <- fetch attestationCid
+        assertMsg "attestation must come from the agreed oracle" (attestation.oracle == oracle)
+        assertMsg "attestation is for a different invoice"
+          (attestation.seller == seller && attestation.invoiceId == invoiceId)
+        assertMsg "milestone not yet reached for this tranche" (attestation.milestone >= tranche.milestone)
+
         invoice <- fetch invoiceCid
         assertMsg "invoice mismatch" (invoice.invoiceId == invoiceId)
+        assertMsg "invoice already financed elsewhere" (releasedCount > 0 || not invoice.financed)
         archive invoiceCid
-        newInvoiceCid <- create invoice with financed = True
-        newAgreementCid <- create this with invoiceCid = newInvoiceCid
-        pure (newAgreementCid, newInvoiceCid)
+        newInvoiceCid <- create invoice with financed = True; milestone = attestation.milestone
 
-    -- | Agentic milestone-triggered tranche release. Called by the seller's
-    -- backend agent once a logistics/ERP webhook reports the milestone
-    -- required by the funding terms (e.g. Delivered) — no manual bank
-    -- audit step, no exposure of the underlying shipment data to the lender.
-    nonconsuming choice FundingAgreement_ReleaseOnMilestone : ()
+        escrow <- case escrowCid of
+          Some cid -> pure cid
+          None -> abort "no escrow left"
+        escrowHolding <- fetch escrow
+        -- The last tranche takes whatever is left, so rounding never strands dust in escrow.
+        let isLast = releasedCount == length tranches - 1
+            amount = if isLast then escrowHolding.amount else faceValue * tranche.fraction
+        (payCid, restCid) <- exercise escrow Holding_Split with splitAmount = amount
+        paidCid <- exercise payCid Holding_Transfer with newOwner = seller
+
+        now <- getTime
+        newAgreementCid <- create this with
+          invoiceCid = newInvoiceCid
+          escrowCid = restCid
+          releasedCount = releasedCount + 1
+          releasedTotal = releasedTotal + amount
+          feeAccrued = feeAccrued + discountFee discountRate amount now dueDate
+        pure (newAgreementCid, paidCid)
+
+    -- | Final repayment: the buyer pays the seller off-ledger (buyer is not
+    -- a Canton party), and the seller repays released principal plus the
+    -- accrued fee to the lender. Any unreleased escrow goes back to the
+    -- lender, and the invoice is closed. The repayment holding must be
+    -- pre-split to the exact amount so the lender never sees the seller's
+    -- wider balance. Returns the lender's repayment holding.
+    choice FundingAgreement_Settle : ContractId CashHolding
       with
-        observedMilestone : MilestoneStatus
+        repaymentCid : ContractId CashHolding
       controller seller
       do
-        assertMsg "milestone not yet at required stage" (observedMilestone == Delivered || observedMilestone == Confirmed)
-        pure ()
+        assertMsg "nothing has been advanced yet" (releasedCount > 0)
+        cash <- fetch repaymentCid
+        assertMsg "repayment must be seller-owned cash of the agreed issuer and currency"
+          (cash.owner == seller && cash.issuer == cashIssuer && cash.currency == currency)
+        assertMsg "repayment must equal released principal plus accrued fee"
+          (cash.amount == releasedTotal + feeAccrued)
+        paidCid <- exercise repaymentCid Holding_Transfer with newOwner = lender
+        case escrowCid of
+          Some cid -> do
+            _ <- exercise cid Holding_SetObservers with newObservers = []
+            pure ()
+          None -> pure ()
+        archive invoiceCid
+        pure paidCid
 
-    -- | Final repayment settlement at due date: buyer's payment (routed
-    -- through seller, since buyer is off-ledger / not a Canton party)
-    -- closes the loop and releases the lender's claim on the invoice.
-    choice FundingAgreement_Settle : ()
-      controller seller, lender
+    -- | Lender walks away before any money has moved, recovering the
+    -- escrow. Blocked once the first tranche has been released.
+    choice FundingAgreement_Cancel : Optional (ContractId CashHolding)
+      controller lender
       do
-        pure ()
+        assertMsg "cannot cancel after a tranche was released" (releasedCount == 0)
+        case escrowCid of
+          Some cid -> Some <$> exercise cid Holding_SetObservers with newObservers = []
+          None -> pure None

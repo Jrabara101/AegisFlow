@@ -1,0 +1,19 @@
+module AegisFlow.Oracle where
+
+import AegisFlow.Types
+
+-- | A logistics milestone signed by an independent oracle party (e.g. the
+-- carrier's integration), not by the seller. The seller sees it and can
+-- present it to release a tranche; the oracle never sees the funding terms.
+-- Only a hash of the underlying shipment evidence goes on-ledger.
+template MilestoneAttestation
+  with
+    oracle       : Party
+    seller       : Party
+    invoiceId    : Text
+    milestone    : MilestoneStatus
+    evidenceHash : Text    -- ^ Hash of the carrier document, e.g. anchored via Cygnet.
+    attestedAt   : Time
+  where
+    signatory oracle
+    observer seller

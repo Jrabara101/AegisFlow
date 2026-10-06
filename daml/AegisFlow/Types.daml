@@ -1,0 +1,18 @@
+module AegisFlow.Types where
+
+-- | Milestone status attested by the logistics oracle. Ordered, so a later
+-- milestone satisfies any tranche gated on an earlier one.
+data MilestoneStatus
+  = Pending
+  | Shipped
+  | Delivered
+  | Confirmed
+  deriving (Eq, Ord, Show)
+
+-- | One slice of the advance, released once `milestone` is attested.
+-- `fraction` is a share of the invoice face value, e.g. 0.6 for 60%.
+data Tranche = Tranche
+  with
+    milestone : MilestoneStatus
+    fraction  : Decimal
+  deriving (Eq, Show)

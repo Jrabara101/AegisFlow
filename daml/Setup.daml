@@ -2,16 +2,27 @@ module Setup where
 
 import Daml.Script
 import DA.Time (days, addRelTime)
+import AegisFlow.Types
+import AegisFlow.Cash
+import AegisFlow.Oracle
 import AegisFlow.Factoring
 
--- | End-to-end demo: seller tokenizes an invoice, proposes financing to a
--- lender-only view, the lender accepts, the seller draws down the advance,
--- an agentic milestone update fires, and the funding is settled. Run with:
+-- | Sum of the cash `p` owns (excluding holdings merely disclosed to `p`).
+balanceOf : Party -> Script Decimal
+balanceOf p = do
+  holdings <- query @CashHolding p
+  pure $ sum [h.amount | (_, h) <- holdings, h.owner == p]
+
+-- | End-to-end demo of a $100,000 invoice financed at 90% in two tranches
+-- (60% on Shipped, 30% on Delivered) at a 12% annual discount rate, with
+-- milestones signed by an independent logistics oracle. Run with:
 --   daml script --dar .daml/dist/aegisflow-0.1.0.dar --script-name Setup:setup --ledger-host localhost --ledger-port 6865
 setup : Script ()
 setup = do
   seller <- allocateParty "Seller"
   lender <- allocateParty "Lender"
+  oracle <- allocateParty "LogisticsOracle"
+  issuer <- allocateParty "CashIssuer"
   outsider <- allocateParty "Outsider"
 
   now <- getTime
@@ -32,47 +43,111 @@ setup = do
       invoiceId = "INV-2026-0091"
       faceValue = 100000.0
       dueDate = due
-      milestone = Shipped
+      milestone = Pending
       financed = False
 
-  -- 2. Seller proposes financing to exactly one lender at a 90% advance rate.
+  -- 2. The lender holds 1,000,000 USD and, in its own private transaction,
+  --    splits off exactly the 90,000 advance to use as escrow.
+  lenderCashCid <- submit issuer do
+    createCmd CashHolding with
+      issuer
+      owner = lender
+      currency = "USD"
+      amount = 1000000.0
+      observers = []
+  (escrowCid, _) <- submit lender do
+    exerciseCmd lenderCashCid Holding_Split with splitAmount = 90000.0
+
+  -- 3. Seller proposes financing to exactly one lender.
   proposalCid <- submit seller do
     exerciseCmd invoiceCid InvoiceAsset_ProposeFinancing with
       lender
-      advanceRate = 0.90
+      oracle
+      tranches = [Tranche Shipped 0.6, Tranche Delivered 0.3]
+      discountRate = 0.12
+      cashIssuer = issuer
+      currency = "USD"
 
-  -- 3. `outsider` has no visibility into either contract — privacy check.
+  -- 4. `outsider` has no visibility into the proposal — privacy check.
   outsiderView <- queryContractId @FundingProposal outsider proposalCid
   assertMsg "outsider must not see the funding proposal" (outsiderView == None)
 
-  -- 4. Lender accepts, creating the bilateral FundingAgreement.
+  -- 5. Lender accepts, locking the 90,000 escrow into the agreement.
   agreementCid <- submit lender do
-    exerciseCmd proposalCid FundingProposal_Accept
+    exerciseCmd proposalCid FundingProposal_Accept with escrowCid
 
-  -- 5. Atomic disbursement: invoice flips to `financed = True` in the same
-  --    transaction the advance is released.
-  (agreementCid2, invoiceCid2) <- submit seller do
-    exerciseCmd agreementCid FundingAgreement_Disburse
+  -- 6. The oracle attests the shipment; the seller's agent presents it and
+  --    tranche 1 (60,000) lands in the seller's wallet atomically with the
+  --    invoice being locked as financed.
+  shippedCid <- submit oracle do
+    createCmd MilestoneAttestation with
+      oracle
+      seller
+      invoiceId = "INV-2026-0091"
+      milestone = Shipped
+      evidenceHash = "sha256:3f1c...bill-of-lading"
+      attestedAt = now
+  (agreementCid, _) <- submit seller do
+    exerciseCmd agreementCid FundingAgreement_ReleaseTranche with attestationCid = shippedCid
 
-  -- 6. Agentic trigger: seller's backend reports a Delivered milestone from
-  --    the logistics API, releasing the held tranche per the agreed terms.
+  sellerAfterT1 <- balanceOf seller
+  assertMsg "seller should hold tranche 1" (sellerAfterT1 == 60000.0)
+
+  -- 7. Ten days later the goods are delivered; tranche 2 (30,000) releases.
+  passTime (days 10)
+  deliveredAt <- getTime
+  deliveredCid <- submit oracle do
+    createCmd MilestoneAttestation with
+      oracle
+      seller
+      invoiceId = "INV-2026-0091"
+      milestone = Delivered
+      evidenceHash = "sha256:9a7e...proof-of-delivery"
+      attestedAt = deliveredAt
+  (agreementCid, _) <- submit seller do
+    exerciseCmd agreementCid FundingAgreement_ReleaseTranche with attestationCid = deliveredCid
+
+  sellerAfterT2 <- balanceOf seller
+  assertMsg "seller should hold both tranches" (sellerAfterT2 == 90000.0)
+
+  -- 8. At the due date the buyer pays the seller 100,000 (arriving as
+  --    stablecoin). Fee: 60,000 x 12% x 60/360 = 1,200 plus
+  --    30,000 x 12% x 50/360 = 500, so the seller owes 91,700.
+  passTime (days 50)
+  buyerPaymentCid <- submit issuer do
+    createCmd CashHolding with
+      issuer
+      owner = seller
+      currency = "USD"
+      amount = 100000.0
+      observers = []
+
+  Some agreement <- queryContractId seller agreementCid
+  let repaymentDue = agreement.releasedTotal + agreement.feeAccrued
+  assertMsg "repayment should be principal plus 1,700 fee" (repaymentDue == 91700.0)
+
+  (repaymentCid, _) <- submit seller do
+    exerciseCmd buyerPaymentCid Holding_Split with splitAmount = repaymentDue
   _ <- submit seller do
-    exerciseCmd invoiceCid2 InvoiceAsset_UpdateMilestone with
-      newMilestone = Delivered
+    exerciseCmd agreementCid FundingAgreement_Settle with repaymentCid
 
-  submit seller do
-    exerciseCmd agreementCid2 FundingAgreement_ReleaseOnMilestone with
-      observedMilestone = Delivered
+  -- 9. Final balances: the lender earned the 1,700 fee; the seller got
+  --    90% of the invoice up to 60 days early and keeps 98,300 of 100,000.
+  lenderFinal <- balanceOf lender
+  sellerFinal <- balanceOf seller
+  assertMsg "lender should end with principal plus fee" (lenderFinal == 1001700.0)
+  assertMsg "seller should end with 98,300" (sellerFinal == 98300.0)
 
-  -- 7. Final settlement at due date, requires both signatures.
-  submitMulti [seller, lender] [] do
-    exerciseCmd agreementCid2 FundingAgreement_Settle
-
-  -- 8. Privacy check: after the full lifecycle, the lender and outsider
-  --    still cannot see the buyer identity or line items.
+  -- 10. Privacy checks after the full lifecycle: the lender and outsider
+  --     never see buyer details, the outsider sees no cash at all, and the
+  --     oracle never sees the funding terms.
   lenderDetails <- queryContractId @InvoiceDetails lender detailsCid
   assertMsg "lender must not see invoice details" (lenderDetails == None)
   outsiderDetails <- queryContractId @InvoiceDetails outsider detailsCid
   assertMsg "outsider must not see invoice details" (outsiderDetails == None)
+  outsiderCash <- query @CashHolding outsider
+  assertMsg "outsider must not see any cash holdings" (null outsiderCash)
+  oracleAgreements <- query @FundingAgreement oracle
+  assertMsg "oracle must not see funding agreements" (null oracleAgreements)
 
   pure ()

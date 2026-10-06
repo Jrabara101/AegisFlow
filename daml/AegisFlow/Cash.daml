@@ -1,0 +1,50 @@
+module AegisFlow.Cash where
+
+-- | Minimal stablecoin stand-in. The issuer is the sole signatory, so the
+-- owner can split, transfer or disclose a holding without the issuer
+-- taking part. A production deployment would swap this for a Canton Token
+-- Standard holding (e.g. USDC via xReserve) behind the same choices.
+template CashHolding
+  with
+    issuer    : Party
+    owner     : Party
+    currency  : Text
+    amount    : Decimal
+    observers : [Party]   -- ^ Parties the owner has disclosed this holding to.
+  where
+    signatory issuer
+    observer owner, observers
+    ensure amount > 0.0
+
+    -- | Splits off `splitAmount`. Returns the split holding and the
+    -- remainder, if any. Both keep the current observers.
+    choice Holding_Split : (ContractId CashHolding, Optional (ContractId CashHolding))
+      with
+        splitAmount : Decimal
+      controller owner
+      do
+        assertMsg "split amount must be positive and not exceed the holding" (splitAmount > 0.0 && splitAmount <= amount)
+        splitCid <- create this with amount = splitAmount
+        if splitAmount == amount
+          then pure (splitCid, None)
+          else do
+            restCid <- create this with amount = amount - splitAmount
+            pure (splitCid, Some restCid)
+
+    -- | Moves the whole holding to `newOwner` and clears all disclosures.
+    choice Holding_Transfer : ContractId CashHolding
+      with
+        newOwner : Party
+      controller owner
+      do
+        create this with owner = newOwner; observers = []
+
+    -- | Replaces the disclosure list. Used to lock escrow: the lender
+    -- discloses the advance to the seller so the seller can draw it down
+    -- inside a funding agreement.
+    choice Holding_SetObservers : ContractId CashHolding
+      with
+        newObservers : [Party]
+      controller owner
+      do
+        create this with observers = newObservers
