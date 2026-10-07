@@ -65,11 +65,28 @@ export class MockCarrier {
     return this.#deliver(s.lastEvent);
   }
 
-  async #deliver(event) {
+  // Simulates an attacker who knows the webhook URL but not the shared
+  // secret, claiming the goods were delivered to unlock the next tranche
+  // early. Does not touch the real shipment. The oracle must reject it.
+  async forge(invoiceId) {
+    const s = this.#shipment(invoiceId);
+    const event = {
+      eventId: randomUUID(),
+      invoiceId,
+      trackingNumber: s.trackingNumber,
+      status: 'delivered',
+      occurredAt: new Date().toISOString(),
+      document: { kind: 'proof_of_delivery', reference: 'FORGED' },
+    };
+    this.log.record('carrier', 'forged_webhook', `Attacker sent a forged "delivered" webhook for ${invoiceId}`, { eventId: event.eventId }, 'warn');
+    return this.#deliver(event, signPayload(JSON.stringify(event), 'attacker-guess'));
+  }
+
+  async #deliver(event, signature) {
     const body = JSON.stringify(event);
     const res = await this.fetch(this.webhookUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Carrier-Signature': signPayload(body, this.secret) },
+      headers: { 'Content-Type': 'application/json', 'X-Carrier-Signature': signature ?? signPayload(body, this.secret) },
       body,
     });
     const result = await res.json().catch(() => ({}));

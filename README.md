@@ -15,6 +15,7 @@ daml/
   Tests.daml                       # negative-path tests (attacks and mistakes the ledger rejects)
   Init.daml                        # seeds a running ledger with parties + one funded deal for the backend
 backend/                           # Node.js agent layer: mock carrier, logistics oracle, seller agent (see backend/README.md)
+frontend/                          # React + Tailwind demo dashboard: three private views, live agent feed (see frontend/README.md)
 Bookmark.md                        # hackathon links, devtools catalog, starter repos
 ```
 
@@ -57,7 +58,7 @@ daml install 2.10.6
 ```
 daml test
 ```
-runs the demo and all tests against an ephemeral ledger. To run the full system with the backend agent, see [backend/README.md](backend/README.md). Against a running sandbox:
+runs the demo and all tests against an ephemeral ledger. To run the full system with the backend agent and the dashboard, see [frontend/README.md](frontend/README.md). Against a running sandbox:
 ```
 daml build
 daml script --dar .daml/dist/aegisflow-0.1.0.dar --script-name Setup:setup --ledger-host localhost --ledger-port 6865

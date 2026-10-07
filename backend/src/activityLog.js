@@ -1,6 +1,8 @@
-import { appendFileSync, mkdirSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
+
+const HISTORY_LIMIT = 1000;
 
 // Timestamped record of every decision the carrier, oracle and agent make.
 // Kept in memory for the API, appended to a JSONL file for audit, and
@@ -10,7 +12,27 @@ export class ActivityLog {
     this.file = file;
     this.entries = [];
     this.subscribers = new Set();
-    if (file) mkdirSync(path.dirname(file), { recursive: true });
+    if (file) {
+      mkdirSync(path.dirname(file), { recursive: true });
+      this.entries = ActivityLog.#readHistory(file);
+    }
+  }
+
+  // Entries from earlier runs against the same ledger. `npm run init-ledger`
+  // deletes the file when it seeds a fresh ledger.
+  static #readHistory(file) {
+    if (!existsSync(file)) return [];
+    return readFileSync(file, 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .flatMap((line) => {
+        try {
+          return [JSON.parse(line)];
+        } catch {
+          return []; // a line cut short by a crash
+        }
+      })
+      .slice(-HISTORY_LIMIT);
   }
 
   // actor: 'carrier' | 'oracle' | 'agent'; level: 'info' | 'warn' | 'error'

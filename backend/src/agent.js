@@ -36,7 +36,22 @@ export class SellerAgent {
   start() {
     this.log.record('agent', 'started', `Watching for milestone attestations every ${this.pollMs} ms`);
     this.timer = setInterval(() => this.tick(), this.pollMs);
-    return this.tick();
+    return this.#skipClosedDeals().then(() => this.tick());
+  }
+
+  // After a restart, attestations for deals that already settled are still
+  // on the ledger. Mark them handled up front instead of logging each one.
+  async #skipClosedDeals() {
+    try {
+      const [attestations, agreements] = await Promise.all([
+        this.ledger.query(this.templates.MilestoneAttestation),
+        this.ledger.query(this.templates.FundingAgreement),
+      ]);
+      const open = new Set(agreements.map((a) => a.payload.invoiceId));
+      for (const a of attestations) if (!open.has(a.payload.invoiceId)) this.handled.add(a.contractId);
+    } catch {
+      // The first tick reports ledger problems.
+    }
   }
 
   stop() {
@@ -147,7 +162,21 @@ export class SellerAgent {
 
     this.log.record('agent', 'settled',
       `Settled ${invoiceId}: repaid ${repaymentDue} ${terms.currency} (principal ${terms.releasedTotal} + fee ${terms.feeAccrued}) to lender`,
-      { invoiceId, repaymentDue, principal: terms.releasedTotal, fee: terms.feeAccrued, lenderHoldingCid: repaid });
+      {
+        invoiceId, repaymentDue, principal: terms.releasedTotal, fee: terms.feeAccrued, lenderHoldingCid: repaid,
+        // Settling archives the agreement; keep its terms for the audit trail and the dashboard.
+        terms: {
+          faceValue: terms.faceValue,
+          advanceAmount: terms.advanceAmount,
+          tranches: terms.tranches,
+          discountRate: terms.discountRate,
+          dueDate: terms.dueDate,
+          currency: terms.currency,
+          releasedCount: terms.releasedCount,
+          releasedTotal: terms.releasedTotal,
+          feeAccrued: terms.feeAccrued,
+        },
+      });
     return { invoiceId, repaymentDue, principal: terms.releasedTotal, fee: terms.feeAccrued };
   }
 }

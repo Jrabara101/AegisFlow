@@ -32,3 +32,11 @@ test('replay re-sends the identical event', async () => {
   await carrier.replay('INV-1');
   assert.equal(sent[0].body, sent[1].body);
 });
+
+test('forge sends a wrongly signed delivery without moving the shipment', async () => {
+  const { carrier, sent } = carrierWithRecorder();
+  await carrier.forge('INV-1');
+  assert.equal(carrier.status('INV-1').status, 'not_shipped');
+  assert.equal(JSON.parse(sent[0].body).status, 'delivered');
+  assert.notEqual(sent[0].signature, signPayload(sent[0].body, 's'));
+});

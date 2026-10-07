@@ -123,3 +123,12 @@ test('a transient failure succeeds on the next poll', async () => {
   await agent.tick();
   assert.equal(ledger.state.releasedCount, 1);
 });
+
+test('on start, attestations of already-settled deals are skipped silently', async () => {
+  const ledger = fakeSellerLedger({ releasedCount: 3 }); // no active agreement: deal settled
+  ledger.state.attestations = [attestation('Shipped'), attestation('Delivered')];
+  const { agent, log } = agentWith(ledger);
+  await agent.start();
+  agent.stop();
+  assert.deepEqual(types(log), ['started']);
+});

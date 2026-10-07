@@ -4,10 +4,12 @@ import { ActivityLog } from './activityLog.js';
 import { MockCarrier } from './carrier.js';
 import { LogisticsOracle } from './oracle.js';
 import { SellerAgent } from './agent.js';
+import { DealDesk } from './deals.js';
 import { createServer } from './server.js';
 
 const parties = loadParties();
-const templates = templateIds(loadPackageId());
+const packageId = loadPackageId();
+const templates = templateIds(packageId);
 const ledgerFor = (party) => new LedgerClient(config.jsonApiUrl, party);
 const ledgers = {
   seller: ledgerFor(parties.seller),
@@ -38,7 +40,10 @@ const agent = new SellerAgent({
   pollMs: config.agentPollMs,
 });
 
-const server = createServer({ carrier, oracle, agent, log, ledgers, templates });
+const deals = new DealDesk({ ledgers, parties, templates, log });
+const info = { packageId, parties, jsonApiUrl: config.jsonApiUrl };
+
+const server = createServer({ carrier, oracle, agent, deals, log, ledgers, templates, info });
 server.listen(config.port, () => {
   console.log(`AegisFlow backend on http://localhost:${config.port} (JSON API ${config.jsonApiUrl})`);
   agent.start();

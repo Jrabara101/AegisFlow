@@ -21,13 +21,16 @@ function readBody(req) {
 //   POST /webhooks/carrier                      carrier -> oracle (HMAC-signed)
 //   POST /demo/shipments/:invoiceId/advance     move the mock shipment to its next status
 //   POST /demo/shipments/:invoiceId/replay      re-send the last carrier webhook (duplicate test)
+//   POST /demo/shipments/:invoiceId/forge       attacker sends a wrongly signed webhook (must be rejected)
 //   GET  /demo/shipments/:invoiceId             current mock shipment status
 //   POST /demo/invoices/:invoiceId/buyer-payment  buyer pays; agent settles with the lender
+//   POST /demo/deals                            open a fresh funded deal (restarts the demo)
 //   GET  /api/activity                          agent activity log
 //   GET  /api/events                            live activity feed (Server-Sent Events)
 //   GET  /api/view/:role                        what seller | lender | oracle | outsider can see
+//   GET  /api/ledger-info                       package id and party ids the backend acts as
 //   GET  /health
-export function createServer({ carrier, oracle, agent, log, ledgers, templates }) {
+export function createServer({ carrier, oracle, agent, deals, log, ledgers, templates, info }) {
   const routes = [
     ['POST', /^\/webhooks\/carrier$/, async (req, res) => {
       const result = await oracle.handleWebhook(await readBody(req), req.headers['x-carrier-signature']);
@@ -39,11 +42,17 @@ export function createServer({ carrier, oracle, agent, log, ledgers, templates }
     ['POST', /^\/demo\/shipments\/([^/]+)\/replay$/, async (req, res, [invoiceId]) => {
       send(res, 200, await carrier.replay(invoiceId));
     }],
+    ['POST', /^\/demo\/shipments\/([^/]+)\/forge$/, async (req, res, [invoiceId]) => {
+      send(res, 200, await carrier.forge(invoiceId));
+    }],
     ['GET', /^\/demo\/shipments\/([^/]+)$/, async (req, res, [invoiceId]) => {
       send(res, 200, carrier.status(invoiceId));
     }],
     ['POST', /^\/demo\/invoices\/([^/]+)\/buyer-payment$/, async (req, res, [invoiceId]) => {
       send(res, 200, await agent.settleOnBuyerPayment(invoiceId));
+    }],
+    ['POST', /^\/demo\/deals$/, async (req, res) => {
+      send(res, 201, await deals.open());
     }],
     ['GET', /^\/api\/activity$/, async (req, res) => {
       send(res, 200, log.list());
@@ -58,6 +67,9 @@ export function createServer({ carrier, oracle, agent, log, ledgers, templates }
     ['GET', /^\/api\/view\/([^/]+)$/, async (req, res, [role]) => {
       if (!ROLES.includes(role)) return send(res, 404, { error: `unknown role; use one of ${ROLES.join(', ')}` });
       send(res, 200, await partyView(ledgers[role], templates));
+    }],
+    ['GET', /^\/api\/ledger-info$/, async (req, res) => {
+      send(res, 200, info);
     }],
     ['GET', /^\/health$/, async (req, res) => {
       send(res, 200, { ok: true });

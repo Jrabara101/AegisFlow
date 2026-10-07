@@ -36,12 +36,15 @@ npm run demo          # 4. drive the full lifecycle and print what each party se
 |---|---|---|
 | POST | `/demo/shipments/:invoiceId/advance` | Move the shipment to its next status (sends the webhook) |
 | POST | `/demo/shipments/:invoiceId/replay` | Re-send the last webhook — the oracle must ignore it |
+| POST | `/demo/shipments/:invoiceId/forge` | Attacker sends a wrongly signed "delivered" webhook — the oracle must reject it (401) |
 | GET | `/demo/shipments/:invoiceId` | Current shipment status |
 | POST | `/demo/invoices/:invoiceId/buyer-payment` | Buyer pays; agent repays principal + fee to the lender |
+| POST | `/demo/deals` | Open a fresh funded deal (next `INV-<year>-NNNN`) — restarts the demo without restarting the ledger |
 | POST | `/webhooks/carrier` | Carrier → oracle (header `X-Carrier-Signature`: HMAC-SHA256 hex of the body) |
 | GET | `/api/view/:role` | What `seller`, `lender`, `oracle` or `outsider` can see — queried *as that party* |
 | GET | `/api/activity` | Activity log |
 | GET | `/api/events` | Live activity feed (Server-Sent Events) |
+| GET | `/api/ledger-info` | Deployed Daml package id and the party ids the backend acts as |
 
 ## Configuration
 
@@ -64,4 +67,6 @@ Unit tests with fake ledgers (no sandbox needed): signature checks, tampered bod
 - Ledger auth is off; `devToken` builds unsigned party tokens. A real deployment gets tokens from an identity provider.
 - One seller is assumed; a real oracle maps each shipment to its seller at registration.
 - The buyer's payment is simulated by the cash issuer crediting the seller.
-- Dedupe and handled-attestation state are in memory; after a restart the agent re-checks every attestation, which is safe because it only submits releases a milestone actually unlocks.
+- Dedupe and handled-attestation state are in memory; after a restart the agent re-checks attestations of open deals, which is safe because it only submits releases a milestone actually unlocks.
+- The activity log is reloaded from `data/activity.jsonl` on start; `npm run init-ledger` deletes it, since a fresh ledger starts a fresh history.
+- `/demo/deals` tops the lender up from the cash issuer when it runs low.
