@@ -26,6 +26,16 @@ venv/
 *.pem
 *.key
 
+# Demo recordings, captions and local notes (videos live on YouTube; >100 MB breaks GitHub)
+*.mp4
+*.mov
+*.srt
+Video/
+hackathon-notes/
+
+# Sandbox logs
+log/
+
 # Claude Code local settings
 .claude/settings.local.json
 
