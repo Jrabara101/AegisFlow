@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { api } from '../lib/api.js';
 
 const KEEP = 400;
+const RETRY_MS = 3000;
 
 const merge = (current, incoming) => {
   const seen = new Set(current.map((e) => e.id));
@@ -19,21 +20,42 @@ export function useActivity() {
   const [latest, setLatest] = useState(null);
 
   useEffect(() => {
+    let source = null;
+    let retry = null;
+    let stopped = false;
     const backfill = () => api.activity().then((list) => setEntries((prev) => merge(prev, list)), () => {});
-    const source = new EventSource(api.eventsUrl());
-    // EventSource reconnects on its own; backfill whatever was missed.
-    source.onopen = () => {
-      setConnection('live');
-      backfill();
+
+    const connect = () => {
+      source = new EventSource(api.eventsUrl());
+      // On a reconnect, backfill whatever was missed while disconnected.
+      source.onopen = () => {
+        setConnection('live');
+        backfill();
+      };
+      source.onerror = () => {
+        setConnection('reconnecting');
+        // EventSource retries a dropped stream by itself, but gives up for
+        // good when a retry gets an error response (the dev proxy answers
+        // 5xx while the backend restarts). Open a new one in that case.
+        if (source.readyState === EventSource.CLOSED && !stopped) {
+          clearTimeout(retry);
+          retry = setTimeout(connect, RETRY_MS);
+        }
+      };
+      source.onmessage = (message) => {
+        const entry = JSON.parse(message.data);
+        setEntries((prev) => merge(prev, [entry]));
+        setLatest(entry);
+      };
     };
-    source.onerror = () => setConnection('reconnecting');
-    source.onmessage = (message) => {
-      const entry = JSON.parse(message.data);
-      setEntries((prev) => merge(prev, [entry]));
-      setLatest(entry);
-    };
+
+    connect();
     backfill();
-    return () => source.close();
+    return () => {
+      stopped = true;
+      clearTimeout(retry);
+      source?.close();
+    };
   }, []);
 
   return { entries, connection, latest };
